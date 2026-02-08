@@ -3,20 +3,14 @@ import duckdb
 import pandas as pd
 import plotly.express as px
 
-# --- Page Config ---
 st.set_page_config(page_title="Backblaze Drive Stats", layout="wide")
 
-st.title("💽 Backblaze Drive Stats Explorer")
-st.markdown("Querying the public Iceberg dataset directly from Backblaze B2.")
+st.title("📊 Backblaze Drive Stats Analyzer")
 
-# --- Database Connection ---
 @st.cache_resource
-def get_duckdb_connection():
-    con = duckdb.connect(database=':memory:')
-    con.execute("INSTALL iceberg; LOAD iceberg;")
-    con.execute("INSTALL httpfs; LOAD httpfs;")
-    
-    # Configure the connection for Backblaze B2
+def get_con():
+    con = duckdb.connect()
+    con.execute("INSTALL iceberg; LOAD iceberg; INSTALL httpfs; LOAD httpfs;")
     con.execute("""
         SET s3_region='us-west-004';
         SET s3_endpoint='s3.us-west-004.backblazeb2.com';
@@ -24,65 +18,77 @@ def get_duckdb_connection():
         SET s3_secret_access_key='K004Fs/bgmTk5dgo6GAVm2Waj3Ka+TE';
         SET s3_use_ssl=true;
         SET s3_url_style='path';
-        
-        -- THE CRITICAL FIX:
-        -- Tells DuckDB to look for the latest metadata.json file automatically
         SET unsafe_enable_version_guessing = true;
-        
-        -- Jitter protection for cloud hosting
-        SET http_timeout=30000;
-        SET http_retries=3;
     """)
     return con
 
-con = get_duckdb_connection()
+con = get_con()
 
-# --- Sidebar ---
-st.sidebar.header("Filter Settings")
-# Using a common model as default to ensure results
-model_id = st.sidebar.text_input("Drive Model", value="ST4000DM000")
-limit = st.sidebar.slider("Sample Size", 100, 5000, 1000)
+# --- Search Interface ---
+st.sidebar.header("Search Parameters")
+# Using the model you mentioned as default
+model_input = st.sidebar.text_input("Drive Model", value="HUH721212ALN604")
+lookback_limit = st.sidebar.number_input("Max Records to Scan", value=20000)
 
-if st.sidebar.button("Search Database"):
+if st.sidebar.button("Analyze Model"):
     try:
-        with st.spinner(f"Scanning Iceberg metadata for {model_id}..."):
-            # We query the scan function directly
-            sql = f"""
+        with st.spinner(f"Searching for {model_input}..."):
+            # 1. Use ILIKE for case-insensitive partial matching
+            # 2. Calculate AFR: (Failures / Total Drive Days) * 365 * 100
+            query = f"""
                 SELECT 
-                    date, 
-                    serial_number, 
-                    model, 
-                    capacity_bytes / 1e12 as capacity_tb, 
-                    failure
+                    date,
+                    model,
+                    capacity_bytes / 1e12 as capacity_tb,
+                    failure,
+                    smart_9_raw as power_on_hours
                 FROM iceberg_scan('s3://drivestats-iceberg/drivestats')
-                WHERE model = '{model_id}'
+                WHERE model ILIKE '%{model_input}%'
                 ORDER BY date DESC
-                LIMIT {limit}
+                LIMIT {lookback_limit}
             """
-            df = con.execute(sql).df()
+            df = con.execute(query).df()
 
         if not df.empty:
-            # Metrics
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total Records", len(df))
-            c2.metric("Failures Found", df['failure'].sum())
-            c3.metric("Avg Capacity (TB)", f"{df['capacity_tb'].mean():.1f}")
+            # --- Calculations ---
+            total_records = len(df)
+            total_failures = df['failure'].sum()
+            # Standard Backblaze AFR Calculation
+            afr = (total_failures / total_records) * 365 * 100 if total_records > 0 else 0
+            
+            # --- Metrics ---
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Exact Model Found", df['model'].iloc[0])
+            m2.metric("Total Drive-Days", total_records)
+            m3.metric("Failures", int(total_failures))
+            m4.metric("Est. Annual Failure Rate (AFR)", f"{afr:.2f}%")
 
-            # Visuals
-            st.subheader("Visual: Activity by Date")
-            # Creating a simple timeline of drive reports
-            timeline = df.groupby('date').size().reset_index(name='count')
-            fig = px.bar(timeline, x='date', y='count', title="Daily Report Density")
-            st.plotly_chart(fig, use_container_width=True)
+            # --- Visuals ---
+            col_left, col_right = st.columns(2)
+            
+            with col_left:
+                st.subheader("Reliability: Power On Hours vs Failure")
+                # Visualizing when failures occur relative to drive age
+                fig_age = px.scatter(df, x="power_on_hours", y="failure", 
+                                   color="failure", 
+                                   title="Failure Events by Drive Age (Hours)",
+                                   color_continuous_scale=["#2ecc71", "#e74c3c"])
+                st.plotly_chart(fig_age, use_container_width=True)
 
-            # Table
-            st.subheader("Data Preview")
-            st.dataframe(df, use_container_width=True)
+            with col_right:
+                st.subheader("Data Density (Sample Window)")
+                # Showing the timeframe the data covers
+                fig_time = px.histogram(df, x="date", title="Reports Collected per Day")
+                st.plotly_chart(fig_time, use_container_width=True)
+
+            st.subheader("Recent Data Points")
+            st.dataframe(df.head(100), use_container_width=True)
+            
         else:
-            st.warning("No data found. Note: Model names are case-sensitive.")
+            st.warning(f"No results found for '{model_input}'. Try a shorter version of the model name.")
 
     except Exception as e:
-        st.error("The query engine failed.")
+        st.error("Query Error")
         st.exception(e)
 else:
-    st.info("Enter a model (e.g., ST4000DM000) and click Search.")
+    st.info("Enter a model name in the sidebar and click Analyze.")
