@@ -2,10 +2,9 @@ import streamlit as st
 import duckdb
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 
-st.set_page_config(page_title="Backblaze Drive Stats", layout="wide")
-
-st.title("📊 Backblaze Drive Stats Analyzer")
+st.set_page_config(page_title="Drive Reliability Lab", layout="wide")
 
 @st.cache_resource
 def get_con():
@@ -24,71 +23,99 @@ def get_con():
 
 con = get_con()
 
-# --- Search Interface ---
-st.sidebar.header("Search Parameters")
-# Using the model you mentioned as default
-model_input = st.sidebar.text_input("Drive Model", value="HUH721212ALN604")
-lookback_limit = st.sidebar.number_input("Max Records to Scan", value=20000)
+st.title("🔬 Drive Reliability Research Lab")
+st.caption("Powered by Backblaze Drive Stats + Apache Iceberg")
 
-if st.sidebar.button("Analyze Model"):
+# --- Sidebar ---
+model_input = st.sidebar.text_input("Enter Drive Model", value="HUH721212ALN604")
+# Research needs more data, so we'll increase the scan limit
+scan_limit = st.sidebar.slider("Scan Depth (Rows)", 10000, 100000, 30000)
+
+if st.sidebar.button("Generate Reliability Report"):
     try:
-        with st.spinner(f"Searching for {model_input}..."):
-            # 1. Use ILIKE for case-insensitive partial matching
-            # 2. Calculate AFR: (Failures / Total Drive Days) * 365 * 100
+        with st.spinner("Analyzing fleet data..."):
+            # Query focused on research metrics
             query = f"""
                 SELECT 
                     date,
+                    serial_number,
                     model,
-                    capacity_bytes / 1e12 as capacity_tb,
                     failure,
-                    smart_9_raw as power_on_hours
+                    smart_9_raw as hours
                 FROM iceberg_scan('s3://drivestats-iceberg/drivestats')
                 WHERE model ILIKE '%{model_input}%'
                 ORDER BY date DESC
-                LIMIT {lookback_limit}
+                LIMIT {scan_limit}
             """
             df = con.execute(query).df()
 
         if not df.empty:
-            # --- Calculations ---
-            total_records = len(df)
+            # --- RESEARCH CALCULATIONS ---
+            unique_drives = df['serial_number'].nunique()
+            total_drive_days = len(df)
             total_failures = df['failure'].sum()
-            # Standard Backblaze AFR Calculation
-            afr = (total_failures / total_records) * 365 * 100 if total_records > 0 else 0
             
-            # --- Metrics ---
+            # AFR Formula: (Failures / (Drive Days / 365)) * 100
+            afr = (total_failures / (total_drive_days / 365.0)) * 100 if total_drive_days > 0 else 0
+            
+            # Failure Timing (Hours before failure)
+            failure_data = df[df['failure'] == 1]['hours']
+            avg_failure_hours = failure_data.mean() if not failure_data.empty else 0
+
+            # --- TOP LEVEL METRICS ---
+            st.subheader(f"Reliability Profile: {df['model'].iloc[0]}")
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Exact Model Found", df['model'].iloc[0])
-            m2.metric("Total Drive-Days", total_records)
-            m3.metric("Failures", int(total_failures))
-            m4.metric("Est. Annual Failure Rate (AFR)", f"{afr:.2f}%")
+            m1.metric("Drives Deployed (Sample)", f"{unique_drives:,}")
+            m2.metric("Total Failures", int(total_failures))
+            m3.metric("Annual Failure Rate (AFR)", f"{afr:.2f}%")
+            m4.metric("Avg. Hours at Failure", f"{int(avg_failure_hours):,}" if avg_failure_hours > 0 else "N/A")
 
-            # --- Visuals ---
-            col_left, col_right = st.columns(2)
+            # --- VISUALS ---
+            col_a, col_b = st.columns(2)
+
+            with col_a:
+                st.write("**Failure Distribution (Age in Hours)**")
+                if not failure_data.empty:
+                    fig_hist = px.histogram(failure_data, x="hours", 
+                                          nbins=30, 
+                                          title="When do they die?",
+                                          labels={'hours': 'Power On Hours'},
+                                          color_discrete_sequence=['#e74c3c'])
+                    st.plotly_chart(fig_hist, use_container_width=True)
+                else:
+                    st.info("No failure events in this sample to map timing.")
+
+            with col_b:
+                st.write("**Fleet Activity Timeline**")
+                daily_active = df.groupby('date')['serial_number'].nunique().reset_index()
+                fig_line = px.line(daily_active, x='date', y='serial_number', 
+                                 title="Active Drive Count Over Time")
+                st.plotly_chart(fig_line, use_container_width=True)
+
+            # --- PREDICTIVE S.M.A.R.T. SECTION ---
+            st.divider()
+            st.subheader("Critical Health Indicators")
+            st.markdown("""
+            Research shows these 5 S.M.A.R.T. stats are the strongest predictors of failure. 
+            If your drive has values > 0 here, it is likely in a 'proactive failure' state.
+            """)
             
-            with col_left:
-                st.subheader("Reliability: Power On Hours vs Failure")
-                # Visualizing when failures occur relative to drive age
-                fig_age = px.scatter(df, x="power_on_hours", y="failure", 
-                                   color="failure", 
-                                   title="Failure Events by Drive Age (Hours)",
-                                   color_continuous_scale=["#2ecc71", "#e74c3c"])
-                st.plotly_chart(fig_age, use_container_width=True)
+            # Example of how to pull specific SMART stats for research
+            st.table(pd.DataFrame({
+                "SMART ID": ["5", "187", "188", "197", "198"],
+                "Description": [
+                    "Reallocated Sector Count", 
+                    "Reported Uncorrectable Errors", 
+                    "Command Timeout", 
+                    "Current Pending Sector Count", 
+                    "Offline Uncorrectable"
+                ],
+                "Risk Level": ["High", "Critical", "Moderate", "Critical", "Critical"]
+            }))
 
-            with col_right:
-                st.subheader("Data Density (Sample Window)")
-                # Showing the timeframe the data covers
-                fig_time = px.histogram(df, x="date", title="Reports Collected per Day")
-                st.plotly_chart(fig_time, use_container_width=True)
-
-            st.subheader("Recent Data Points")
-            st.dataframe(df.head(100), use_container_width=True)
-            
         else:
-            st.warning(f"No results found for '{model_input}'. Try a shorter version of the model name.")
+            st.warning("No data found for this model.")
 
     except Exception as e:
-        st.error("Query Error")
+        st.error("Engine Error")
         st.exception(e)
-else:
-    st.info("Enter a model name in the sidebar and click Analyze.")
